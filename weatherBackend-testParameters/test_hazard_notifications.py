@@ -338,6 +338,7 @@ def test_load_geofences_replace(client: TestClient):
     assert data["loaded"] == 1
     assert data["total_cached"] == 1
     assert data["replaced"] is True
+    assert "fetched_at" in data
     # Old zone should be gone
     zones = client.get("/geofences").json()
     assert len(zones) == 1
@@ -389,6 +390,43 @@ def test_load_geofences_invalid_geometry_is_skipped(client: TestClient):
     geofence_service.set_polygons([])
 
 
+def test_load_geofences_non_polygon_geometry_is_skipped(client: TestClient):
+    """Geometries that are not Polygon or MultiPolygon are rejected as invalid."""
+    from geofence_service import geofence_service
+    point_zone = {
+        "event": "Point Zone",
+        "severity": "Low",
+        "geometry": {"type": "Point", "coordinates": [-91.10, 30.45]},
+    }
+    payload = {"hazard_zones": [point_zone, _SAMPLE_ZONE], "replace": True}
+    resp = client.post("/geofences/load", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+    # The Point zone is skipped; only the Polygon zone is loaded
+    assert data["loaded"] == 1
+    assert data["total_cached"] == 1
+    assert "skipped" in data["message"]
+    geofence_service.set_polygons([])
+
+
+def test_load_geofences_missing_geometry_type_is_skipped(client: TestClient):
+    """A geometry dict with no 'type' key is rejected as invalid."""
+    from geofence_service import geofence_service
+    bad_zone = {
+        "event": "No Type Zone",
+        "severity": "Low",
+        "geometry": {"coordinates": [[[-91.25, 30.35], [-90.95, 30.35], [-90.95, 30.55], [-91.25, 30.55], [-91.25, 30.35]]]},
+    }
+    payload = {"hazard_zones": [bad_zone, _SAMPLE_ZONE], "replace": True}
+    resp = client.post("/geofences/load", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["loaded"] == 1
+    assert data["total_cached"] == 1
+    assert "skipped" in data["message"]
+    geofence_service.set_polygons([])
+
+
 def test_load_geofences_check_location_works(client: TestClient):
     """A point inside a loaded zone should be detected by /check-location."""
     payload = {"hazard_zones": [_SAMPLE_ZONE], "replace": True}
@@ -407,6 +445,131 @@ def test_load_geofences_check_location_works(client: TestClient):
 
     from geofence_service import geofence_service
     geofence_service.set_polygons([])
+
+
+# ---------------------------------------------------------------------------
+# POST /geofences/load-nws  (live NWS Alerts API ingest)
+# ---------------------------------------------------------------------------
+
+_MOCK_NWS_RESPONSE = {
+    "features": [
+        {
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [[-91.25, 30.35], [-90.95, 30.35], [-90.95, 30.55], [-91.25, 30.55], [-91.25, 30.35]]
+                ],
+            },
+            "properties": {
+                "event": "Tornado Warning",
+                "severity": "Extreme",
+                "effective": "2026-03-17T00:00:00+00:00",
+                "onset": "2026-03-17T00:00:00+00:00",
+                "expires": "2026-03-17T06:00:00+00:00",
+            },
+        },
+        {
+            # geocode-only alert — no geometry; should be skipped
+            "geometry": None,
+            "properties": {"event": "Winter Storm Watch", "severity": "Moderate"},
+        },
+        {
+            "geometry": {"type": "Point", "coordinates": [-91.10, 30.45]},
+            "properties": {"event": "Special Weather Statement", "severity": "Minor"},
+        },
+    ]
+}
+
+
+def test_load_nws_geofences_success(client: TestClient):
+    """A mocked NWS response with one polygon, one no-geometry, one Point should
+    load exactly 1 zone (the polygon) and skip 2.  The response includes fetched_at
+    and each zone carries effective/onset/expires from the NWS properties."""
+    from geofence_service import geofence_service
+
+    with patch.object(geofence_service, "fetch_alerts", return_value=_MOCK_NWS_RESPONSE):
+        resp = client.post("/geofences/load-nws")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["loaded"] == 1
+    assert data["total_cached"] == 1
+    assert data["replaced"] is True
+    assert "2 skipped" in data["message"]
+    # fetched_at must be present and look like an ISO timestamp
+    assert "fetched_at" in data
+    assert "T" in data["fetched_at"]
+
+    zones = client.get("/geofences").json()
+    assert len(zones) == 1
+    zone = zones[0]
+    assert zone["event"] == "Tornado Warning"
+    # Temporal fields from NWS properties must be surfaced
+    assert zone["effective"] == "2026-03-17T00:00:00+00:00"
+    assert zone["onset"] == "2026-03-17T00:00:00+00:00"
+    assert zone["expires"] == "2026-03-17T06:00:00+00:00"
+
+    geofence_service.set_polygons([])
+
+
+def test_load_nws_geofences_replaces_existing(client: TestClient):
+    """POST /geofences/load-nws should replace any previously cached zones."""
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from geofence_service import geofence_service
+
+    poly = ShapelyPolygon([(-92.1, 30.1), (-91.9, 30.1), (-91.9, 30.3), (-92.1, 30.3), (-92.1, 30.1)])
+    geofence_service.set_polygons([
+        {"event": "Old Zone", "severity": "Low", "geometry": {}, "polygon": poly},
+        {"event": "Another Old Zone", "severity": "Low", "geometry": {}, "polygon": poly},
+    ])
+
+    single_zone_response = {
+        "features": [
+            {
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[-91.25, 30.35], [-90.95, 30.35], [-90.95, 30.55], [-91.25, 30.55], [-91.25, 30.35]]
+                    ],
+                },
+                "properties": {"event": "Flash Flood Warning", "severity": "Severe"},
+            }
+        ]
+    }
+    with patch.object(geofence_service, "fetch_alerts", return_value=single_zone_response):
+        resp = client.post("/geofences/load-nws")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["loaded"] == 1
+    assert data["total_cached"] == 1   # old zones replaced
+
+    geofence_service.set_polygons([])
+
+
+def test_load_nws_geofences_api_error_returns_502(client: TestClient):
+    """When the NWS API is unreachable the endpoint should return 502."""
+    from geofence_service import geofence_service
+
+    with patch.object(geofence_service, "fetch_alerts", side_effect=Exception("connection refused")):
+        resp = client.post("/geofences/load-nws")
+
+    assert resp.status_code == 502
+    assert "NWS API" in resp.json()["detail"]
+
+
+def test_load_nws_geofences_empty_features(client: TestClient):
+    """An NWS response with no features should load 0 zones successfully."""
+    from geofence_service import geofence_service
+
+    with patch.object(geofence_service, "fetch_alerts", return_value={"features": []}):
+        resp = client.post("/geofences/load-nws")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["loaded"] == 0
+    assert data["total_cached"] == 0
+    assert data["replaced"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -445,4 +608,243 @@ def test_load_demo_then_check_location_inside(client: TestClient):
     assert data["event"] == "Tornado Warning"
 
     from geofence_service import geofence_service
+    geofence_service.set_polygons([])
+
+
+
+# ---------------------------------------------------------------------------
+# _parse_wpc_kmz_bytes – Louisiana bounding-box filter
+# ---------------------------------------------------------------------------
+
+# WKT polygons reused across the KMZ filter tests
+_WKT_LA_BATON_ROUGE = "POLYGON((-91.2 30.3, -91.0 30.3, -91.0 30.5, -91.2 30.5, -91.2 30.3))"
+_WKT_NE_NEW_YORK    = "POLYGON((-74.1 40.6, -73.9 40.6, -73.9 40.8, -74.1 40.8, -74.1 40.6))"
+
+
+def _build_minimal_kmz(polygon_wkt: str, name: str = "MRGL") -> bytes:
+    """
+    Build a minimal KMZ (zip of doc.kml) containing a single Placemark whose
+    geometry is described by *polygon_wkt* (a WKT string for a Polygon).
+    """
+    import io as _io
+    import zipfile as _zf
+    from shapely import wkt as shapely_wkt
+
+    poly = shapely_wkt.loads(polygon_wkt)
+    coords = " ".join(f"{x},{y},0" for x, y in poly.exterior.coords)
+    kml_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <Placemark>
+      <name>{name}</name>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>{coords}</coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+  </Document>
+</kml>"""
+    buf = _io.BytesIO()
+    with _zf.ZipFile(buf, "w") as zf:
+        zf.writestr("doc.kml", kml_text)
+    return buf.getvalue()
+
+
+def test_parse_wpc_kmz_bytes_keeps_louisiana_polygon():
+    """A polygon that intersects Louisiana should be retained after parsing."""
+    from geofence_service import GeofenceService
+
+    svc = GeofenceService()
+    # Small polygon centred on Baton Rouge, clearly inside Louisiana
+    kmz = _build_minimal_kmz(_WKT_LA_BATON_ROUGE, name="MRGL")
+    result = svc._parse_wpc_kmz_bytes(kmz, day=1)
+    assert len(result) == 1
+    assert result[0]["event"] == "Excessive Rainfall Outlook"
+    assert result[0]["severity"] == "MRGL"
+
+
+def test_parse_wpc_kmz_bytes_excludes_northeast_polygon():
+    """A polygon located in the northeast US (outside Louisiana) should be filtered out."""
+    from geofence_service import GeofenceService
+
+    svc = GeofenceService()
+    # Small polygon centred on New York City - far outside Louisiana
+    kmz = _build_minimal_kmz(_WKT_NE_NEW_YORK, name="SLGT")
+    result = svc._parse_wpc_kmz_bytes(kmz, day=1)
+    assert result == [], "Northeast polygon should be excluded by the Louisiana bounding-box filter"
+
+
+def test_parse_wpc_kmz_bytes_mixed_polygons():
+    """Only the Louisiana polygon is kept when both a Louisiana and a northeast polygon are present."""
+    import io as _io
+    import zipfile as _zf
+    from shapely import wkt as shapely_wkt
+    from geofence_service import GeofenceService
+
+    def _poly_coords(wkt_str: str) -> str:
+        poly = shapely_wkt.loads(wkt_str)
+        return " ".join(f"{x},{y},0" for x, y in poly.exterior.coords)
+
+    la_coords = _poly_coords(_WKT_LA_BATON_ROUGE)
+    ne_coords = _poly_coords(_WKT_NE_NEW_YORK)
+    kml_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <Placemark><name>MRGL</name>
+      <Polygon><outerBoundaryIs><LinearRing>
+        <coordinates>{la_coords}</coordinates>
+      </LinearRing></outerBoundaryIs></Polygon>
+    </Placemark>
+    <Placemark><name>SLGT</name>
+      <Polygon><outerBoundaryIs><LinearRing>
+        <coordinates>{ne_coords}</coordinates>
+      </LinearRing></outerBoundaryIs></Polygon>
+    </Placemark>
+  </Document>
+</kml>"""
+    buf = _io.BytesIO()
+    with _zf.ZipFile(buf, "w") as zf:
+        zf.writestr("doc.kml", kml_text)
+
+    svc = GeofenceService()
+    result = svc._parse_wpc_kmz_bytes(buf.getvalue(), day=1)
+    assert len(result) == 1
+    assert result[0]["severity"] == "MRGL", "Only the Louisiana (MRGL) polygon should survive"
+
+
+# ---------------------------------------------------------------------------
+# POST /geofences/load-wpc  (WPC KMZ ingest endpoint)
+# ---------------------------------------------------------------------------
+
+
+def _build_la_kmz() -> bytes:
+    """Build a minimal KMZ with one Louisiana polygon (MRGL severity)."""
+    return _build_minimal_kmz(_WKT_LA_BATON_ROUGE, name="MRGL")
+
+
+def test_load_wpc_geofences_success(client: TestClient):
+    """POST /geofences/load-wpc should load Louisiana polygons and return 200."""
+    from geofence_service import geofence_service
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = _build_la_kmz()
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("geofence_service.requests.get", return_value=mock_resp):
+        resp = client.post("/geofences/load-wpc?day=1&replace=true")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["loaded"] == 1
+    assert data["replaced"] is True
+    assert "fetched_at" in data
+    assert "T" in data["fetched_at"]
+    assert "Day 1" in data["message"]
+
+    geofence_service.set_polygons([])
+
+
+def test_load_wpc_geofences_custom_url(client: TestClient):
+    """POST /geofences/load-wpc?url=... should use load_wpc_kmz_by_url with a trusted host."""
+    from geofence_service import geofence_service
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = _build_la_kmz()
+    mock_resp.raise_for_status = MagicMock()
+
+    # Use a trusted WPC hostname
+    custom_url = "https://www.wpc.ncep.noaa.gov/kml/test/day1_ero.kmz"
+    with patch("geofence_service.requests.get", return_value=mock_resp) as mock_get:
+        resp = client.post(f"/geofences/load-wpc?day=1&replace=true&url={custom_url}")
+
+    assert resp.status_code == 200
+    mock_get.assert_called_once()
+    call_url = mock_get.call_args[0][0]
+    assert call_url == custom_url
+
+    geofence_service.set_polygons([])
+
+
+def test_load_wpc_geofences_untrusted_url_returns_400(client: TestClient):
+    """Supplying an untrusted URL (SSRF safeguard) should return 400."""
+    resp = client.post("/geofences/load-wpc?day=1&url=https://evil.example.com/bad.kmz")
+    assert resp.status_code == 400
+    assert "trusted" in resp.json()["detail"].lower() or "invalid" in resp.json()["detail"].lower()
+
+
+def test_load_wpc_geofences_http_error_returns_502(client: TestClient):
+    """When the upstream KMZ server returns an HTTP error, the endpoint returns 502."""
+    from requests import HTTPError
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    mock_resp.content = b""
+    http_error = HTTPError(response=mock_resp)
+    mock_resp.raise_for_status = MagicMock(side_effect=http_error)
+
+    with patch("geofence_service.requests.get", return_value=mock_resp):
+        resp = client.post("/geofences/load-wpc?day=1")
+
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert "Day 1" in detail
+    assert "HTTP" in detail
+
+
+def test_load_wpc_geofences_no_la_polygons_returns_502(client: TestClient):
+    """When KMZ parses fine but no polygons overlap Louisiana, endpoint returns 502."""
+    from geofence_service import geofence_service
+
+    # Build a KMZ with only a northeast polygon (outside Louisiana)
+    ne_kmz = _build_minimal_kmz(_WKT_NE_NEW_YORK, name="SLGT")
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = ne_kmz
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("geofence_service.requests.get", return_value=mock_resp):
+        resp = client.post("/geofences/load-wpc?day=1")
+
+    assert resp.status_code == 502
+    assert "Louisiana" in resp.json()["detail"]
+
+    geofence_service.set_polygons([])
+
+
+def test_load_wpc_geofences_invalid_day_returns_422(client: TestClient):
+    """Day values outside 1–5 should be rejected with a validation error (422)."""
+    resp = client.post("/geofences/load-wpc?day=6")
+    assert resp.status_code == 422
+
+
+def test_load_wpc_geofences_append_mode(client: TestClient):
+    """replace=false should append to existing cache rather than replace it."""
+    from geofence_service import geofence_service
+    from shapely.geometry import Polygon as ShapelyPolygon
+
+    # Pre-populate cache with one zone
+    poly = ShapelyPolygon([(-92.1, 30.1), (-91.9, 30.1), (-91.9, 30.3), (-92.1, 30.3), (-92.1, 30.1)])
+    geofence_service.set_polygons([
+        {"event": "Existing Zone", "severity": "Low", "geometry": {}, "polygon": poly}
+    ])
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = _build_la_kmz()
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("geofence_service.requests.get", return_value=mock_resp):
+        resp = client.post("/geofences/load-wpc?day=1&replace=false")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["replaced"] is False
+    assert data["total_cached"] == 2  # existing + newly loaded
+
     geofence_service.set_polygons([])
